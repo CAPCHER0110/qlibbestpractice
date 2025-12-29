@@ -21,6 +21,6 @@ def execute(config, mode):
     elif mode == 'predict':
         run_predict(config, model_name=model_name)
     elif mode == 'backtest': 
-        run_backtest(config, model_name="ALSTM")
+        run_backtest(config, model_name=model_name)
     else:
         print(f"❌ [TRA] 不支持的模式: {mode}")
