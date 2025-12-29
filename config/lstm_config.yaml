@@ -1,0 +1,128 @@
+qlib_init:
+  # ⚠️ 修改为你的数据路径
+  provider_uri: "data/cn_data"
+  region: cn
+
+market: &market csi300
+benchmark: &benchmark SH000300
+
+data_handler_config: &data_handler_config
+  # 1. 数据加载范围：涵盖所有可用数据
+  start_time: 2005-01-04
+  end_time: 2025-12-31
+  # 2. 拟合区间 (Fit Time)：【非常关键】
+  # 用于计算 RobustZScore 的均值和方差。
+  # 必须严格截止在验证集结束的时间，不能偷看测试集(2024以后)的数据。
+  fit_start_time: 2005-01-04
+  fit_end_time: 2023-12-31
+  instruments: *market
+  
+  # ==========================================
+  # 1. 特征预处理 (关键差异点)
+  # ==========================================
+  infer_processors:
+    # [关键] 筛选 20 个核心因子，匹配模型 d_feat: 20
+    # - class: FilterCol
+    #   kwargs:
+    #     fields_group: feature
+    #     col_list: ["RESI5", "WVMA5", "RSQR5", "KLEN", "RSQR10", "CORR5", "CORD5", "CORR10", 
+    #                "ROC60", "RESI10", "VSTD5", "RSQR60", "CORR60", "WVMA60", "STD5", 
+    #                "RSQR20", "CORD60", "CORD10", "CORR20", "KLOW"]
+    # [关键] 深度学习必须做去极值和标准化
+    - class: RobustZScoreNorm
+      kwargs:
+        fields_group: feature
+        clip_outlier: true
+    # - class: CSZScoreNorm
+    #   kwargs:
+    #     fields_group: feature
+    # [关键] 填充缺失值，防止模型报错
+    - class: Fillna
+      kwargs:
+        fields_group: feature
+
+  learn_processors:
+    - class: DropnaLabel
+    - class: CSRankNorm
+      kwargs:
+        fields_group: label
+  
+  # 标签：预测未来2天的收益率变化 (Qlib 标准写法)
+  label: ["Ref($close, -2) / Ref($close, -1) - 1"]
+
+port_analysis_config: &port_analysis_config
+  strategy:
+    class: TopkDropoutStrategy
+    module_path: qlib.contrib.strategy
+    kwargs:
+      signal: <PRED>
+      topk: 50
+      n_drop: 5
+  backtest:
+    # 3. 回测区间：主要看最近两年的表现
+    start_time: 2024-01-01
+    end_time: 2025-12-26
+    account: 100000000
+    benchmark: *benchmark
+    exchange_kwargs:
+      limit_threshold: 0.095
+      deal_price: close
+      open_cost: 0.0005
+      close_cost: 0.0015
+      min_cost: 5
+
+task:
+  model:
+    class: LSTM
+    # 注意：这里使用的是针对时序优化过的 pytorch_lstm_ts
+    module_path: qlib.contrib.model.pytorch_lstm_ts
+    kwargs:
+      d_feat: 158         # 必须等于 FilterCol 里的因子数量 (20)
+      hidden_size: 64
+      num_layers: 2
+      dropout: 0.0
+      n_epochs: 200
+      lr: 0.001
+      early_stop: 10
+      batch_size: 1024
+      metric: loss
+      loss: mse
+      n_jobs: 0
+      GPU: 0             # 务必确保 torch 已安装且能识别 GPU，否则填 -1
+
+  dataset:
+    # ==========================================
+    # 2. 数据集类型 (关键差异点)
+    # ==========================================
+    # TSDatasetH: Time-Series Dataset，专门用于构建 LSTM 需要的时间序列切片
+    class: TSDatasetH
+    module_path: qlib.data.dataset
+    kwargs:
+      handler:
+        class: Alpha158
+        module_path: qlib.contrib.data.handler
+        kwargs: *data_handler_config
+      segments:
+        # 4. 训练/验证/测试 切分
+        train: [2005-01-04, 2022-12-31] # 主力训练数据
+        valid: [2023-01-01, 2023-12-31] # 用于早停
+        test:  [2024-01-01, 2025-12-26] # 纯样本外测试 (Out-of-sample)
+      # 5. 时间步长
+      # 建议设为 40 或 60，让 LSTM 看过去 2-3 个月的走势
+      step_len: 40
+
+  record: 
+    - class: SignalRecord
+      module_path: qlib.workflow.record_temp
+      kwargs: 
+        model: <MODEL>
+        dataset: <DATASET>
+    - class: SigAnaRecord
+      module_path: qlib.workflow.record_temp
+      kwargs: 
+        ana_long_short: False
+        ann_scaler: 252
+    - class: PortAnaRecord
+      module_path: qlib.workflow.record_temp
+      kwargs: 
+        config: *port_analysis_config

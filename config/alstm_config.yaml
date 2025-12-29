@@ -1,0 +1,121 @@
+qlib_init:
+  provider_uri: "data/cn_data"
+  region: cn
+
+market: &market csi300
+benchmark: &benchmark SH000300
+
+data_handler_config: &data_handler_config
+  # 1. 数据加载范围：涵盖所有可用数据
+  start_time: 2005-01-04
+  end_time: 2025-12-31
+  # 2. 拟合区间 (Fit Time)：【非常关键】
+  # 用于计算 RobustZScore 的均值和方差。
+  # 必须严格截止在验证集结束的时间，不能偷看测试集(2024以后)的数据。
+  fit_start_time: 2005-01-04
+  fit_end_time: 2023-12-31
+  instruments: *market
+  
+  # ==========================================
+  # 特征预处理 (保持全量 158 因子)
+  # ==========================================
+  infer_processors:
+    - class: RobustZScoreNorm
+      kwargs:
+        fields_group: feature
+        clip_outlier: true
+        fit_start_time: 2018-01-01
+        fit_end_time: 2019-12-31
+    - class: Fillna
+      kwargs:
+        fields_group: feature
+
+  learn_processors:
+    - class: DropnaLabel
+    - class: CSZScoreNorm
+      kwargs:
+        fields_group: label
+  
+  label: ["Ref($close, -2) / Ref($close, -1) - 1"]
+
+port_analysis_config: &port_analysis_config
+  strategy:
+    class: TopkDropoutStrategy
+    module_path: qlib.contrib.strategy
+    kwargs:
+      signal: <PRED>
+      topk: 50
+      n_drop: 5
+  backtest:
+    # 3. 回测区间：主要看最近两年的表现
+    start_time: 2024-01-01
+    end_time: 2025-12-26
+    account: 100000000
+    benchmark: *benchmark
+    exchange_kwargs:
+      limit_threshold: 0.095
+      deal_price: close
+      open_cost: 0.0005
+      close_cost: 0.0015
+      min_cost: 5
+
+task:
+  model:
+    # ==========================================
+    # 🆕 升级部分：ALSTM 模型配置
+    # ==========================================
+    class: ALSTM
+    module_path: qlib.contrib.model.pytorch_alstm_ts
+    kwargs:
+      d_feat: 158         # 对应 Alpha158 的全量因子
+      hidden_size: 64     # 隐藏层大小
+      num_layers: 2       # 堆叠层数
+      dropout: 0.0
+      n_epochs: 200
+      lr: 0.001
+      early_stop: 10
+      batch_size: 1024     # 显存允许的情况下，256 或 512 都不错
+      metric: loss
+      loss: mse
+      
+      # [ALSTM 特有参数]
+      rnn_type: GRU       # ALSTM 内部通常可以用 LSTM 或 GRU，GRU 训练稍快
+      
+      n_jobs: 0           # ⚠️ 保持 0 (单进程加载，防崩溃)
+      GPU: 0              # ✅ 使用 RTX 5070
+
+  dataset:
+    # ==========================================
+    # 数据集配置 (ALSTM 同样需要时间序列切片)
+    # ==========================================
+    class: TSDatasetH
+    module_path: qlib.data.dataset
+    kwargs:
+      handler:
+        class: Alpha158
+        module_path: qlib.contrib.data.handler
+        kwargs: *data_handler_config
+      segments:
+        # 4. 训练/验证/测试 切分
+        train: [2005-01-04, 2022-12-31] # 主力训练数据
+        valid: [2023-01-01, 2023-12-31] # 用于早停
+        test:  [2024-01-01, 2025-12-26] # 纯样本外测试 (Out-of-sample)
+      # 5. 时间步长
+      # 建议设为 40 或 60，让 LSTM 看过去 2-3 个月的走势
+      step_len: 40
+
+  record: 
+    - class: SignalRecord
+      module_path: qlib.workflow.record_temp
+      kwargs: 
+        model: <MODEL>
+        dataset: <DATASET>
+    - class: SigAnaRecord
+      module_path: qlib.workflow.record_temp
+      kwargs: 
+        ana_long_short: False
+        ann_scaler: 252
+    - class: PortAnaRecord
+      module_path: qlib.workflow.record_temp
+      kwargs: 
+        config: *port_analysis_config
