@@ -32,7 +32,7 @@ data_handler_config: &data_handler_config
 
   learn_processors:
     - class: DropnaLabel
-    - class: CSZScoreNorm
+    - class: CSRankNorm
       kwargs:
         fields_group: label
   
@@ -79,7 +79,7 @@ task:
       n_epochs: 200
       lr: 0.001
       early_stop: 10
-      batch_size: 1024     # Transformer 并行能力强，可以适当加大 batch_size
+      batch_size: 8192     # Transformer 并行能力强，可以适当加大 batch_size
       metric: loss
       loss: mse
       

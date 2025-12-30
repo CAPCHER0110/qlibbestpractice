@@ -32,6 +32,10 @@ def main():
     parser = argparse.ArgumentParser(description="Qlib 量化交易系统")
     parser.add_argument('--model', type=str, default='lgbm', choices=MODEL_DISPATCHER.keys(), help='模型名称')
     parser.add_argument('--mode', type=str, default='predict', choices=['train', 'predict', 'backtest'], help='运行模式')
+    # =========================================================================
+    # 增加 filter 参数，默认为 csi300
+    # =========================================================================
+    parser.add_argument("--filter", type=str, default="csi300", help="预测/回测的目标池 (csi300/csi500/all)")
     args = parser.parse_args()
 
     # ... (中间的环境初始化代码，保持不变: check paths, ensure_data, qlib.init) ...
@@ -66,7 +70,7 @@ def main():
     if runner:
         print(f"\n🚀 启动任务: Model={args.model.upper()}, Mode={args.mode.upper()}")
         # 调用 models/run_tra.py 里的 execute 函数
-        runner(config, mode=args.mode)
+        runner(config, mode=args.mode, target_pool=args.filter)
     else:
         print(f"❌ 未注册的模型: {args.model}")
 

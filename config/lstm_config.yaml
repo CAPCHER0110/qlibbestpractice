@@ -84,7 +84,7 @@ task:
       n_epochs: 200
       lr: 0.001
       early_stop: 10
-      batch_size: 1024
+      batch_size: 8192
       metric: loss
       loss: mse
       n_jobs: 0

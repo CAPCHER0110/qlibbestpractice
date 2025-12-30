@@ -1,14 +1,17 @@
 import os
 import pickle
 import pandas as pd
+import copy
+from datetime import datetime, timedelta
+from tabulate import tabulate
+import json
+import redis
+
 from qlib.utils import init_instance_by_config
 from qlib.workflow import R
-from qlib.data import D
+from qlib.data import D  # 【新增】必须导入 D 用于回测过滤
 from qlib.data.dataset import DatasetH
 from models.backtest_utils import run_backtest_analysis
-from datetime import datetime, timedelta
-import copy
-from tabulate import tabulate
 from models.stock_utils import stock_mapper
 
 # =============================================================================
@@ -19,23 +22,18 @@ def get_rolling_tasks(start_date, end_date, train_window, step):
     生成滚动训练的任务列表
     返回: [(train_start, train_end, test_start, test_end), ...]
     """
-    # 获取全量交易日历
     calendar = D.calendar(start_time=start_date, end_time=end_date)
     
     tasks = []
-    # 从 train_window 开始，每隔 step 天滚动一次
-    # i 是当前测试段的开始索引
     for i in range(train_window, len(calendar), step):
-        # 确定测试段 (Test Segment)
         test_start_idx = i
         test_end_idx = min(i + step - 1, len(calendar) - 1)
         
         test_start = calendar[test_start_idx]
         test_end = calendar[test_end_idx]
         
-        # 确定训练段 (Train Segment) = 测试段起点 - train_window
         train_start_idx = i - train_window
-        train_end_idx = i - 1  # 训练到测试开始前一天
+        train_end_idx = i - 1  
         
         train_start = calendar[train_start_idx]
         train_end = calendar[train_end_idx]
@@ -50,8 +48,8 @@ def get_rolling_tasks(start_date, end_date, train_window, step):
 # =============================================================================
 # 训练逻辑 (支持 Rolling)
 # =============================================================================
-def _train(config):
-    print(">>> [LGBM] 进入训练流程...")
+def run_train(config, model_name="LGBM"):
+    print(f">>> [{model_name}] 进入训练流程...")
     os.makedirs("artifacts", exist_ok=True)
     os.makedirs("predictions", exist_ok=True)
 
@@ -67,7 +65,7 @@ def _train(config):
         _train_rolling(config)
 
 def _train_static(config):
-    """旧的静态训练逻辑"""
+    """静态训练逻辑"""
     with R.start(experiment_name="lgbm_static"):
         dataset = init_instance_by_config(config['task']['dataset'])
         model = init_instance_by_config(config['task']['model'])
@@ -85,60 +83,34 @@ def _train_static(config):
         print("✅ 静态训练完成。")
 
 def _train_rolling(config):
-    """
-    滚动训练核心逻辑
-    """
-    # 1. 获取滚动参数
+    """滚动训练核心逻辑"""
     step = config['rolling']['step']
     train_window = config['rolling']['train_window']
-    
-    # 使用 config 中定义的 'test' 段作为整个滚动的起止范围
-    # 比如: 2017-01-01 到 2024-12-31
     test_range = config['task']['dataset']['kwargs']['segments']['test']
-    # 为了保证第一次训练有数据，我们需要把 calendar 的起点往前推 train_window 天
-    # 这里简化处理：我们假设数据源足够长，直接用 calendar 算
-    # 获取需要覆盖的测试范围日历
     
-    # 这里的 start_date 应该是整个大回测的开始时间
-    # 我们需要找到第一段测试(2017-01-01) 对应的 训练开始时间(2016-xx-xx)
-    # 简单起见，我们直接传入 config 中的数据起止时间
     handler_start = config['data_handler_config']['start_time']
     handler_end = config['data_handler_config']['end_time']
     
     print(f"    计算滚动任务 (Step={step}, Window={train_window})...")
     
-    # 这里有一个小技巧：我们只在 test 段上进行滚动预测
-    # 但 calendar 需要取更早的时间以包含训练数据
-    # 为了方便，我们直接基于全量日历计算索引，然后只执行在 test_range 范围内的任务
-    
     full_calendar = D.calendar(start_time=handler_start, end_time=handler_end)
     test_start_date = pd.Timestamp(test_range[0])
     
-    # 找到 test_start 在日历中的索引
     try:
         start_idx = full_calendar.tolist().index(test_start_date)
     except ValueError:
-        # 如果不是交易日，找最近的一个
-        # 这里简化处理，直接用 searchsorted
         start_idx = full_calendar.searchsorted(test_start_date)
 
     all_preds = []
     
-    # 准备 dataset 模板 (Handler 复用)
     dataset_conf = config['task']['dataset']
-    # 实例化一个 Handler 对象 (比较耗时，只做一次)
     print("    正在初始化 DataHandler (一次性加载)...")
     handler = init_instance_by_config(dataset_conf['kwargs']['handler'])
 
-    # 开始循环
-    # 我们从 start_idx 开始作为第一个测试段的起点
-    # 训练段就是 [start_idx - train_window, start_idx - 1]
-    
     current_idx = start_idx
     last_model = None
     
     while current_idx < len(full_calendar):
-        # 1. 确定时间窗口
         test_end_idx = min(current_idx + step - 1, len(full_calendar) - 1)
         
         train_start_idx = current_idx - train_window
@@ -156,38 +128,28 @@ def _train_rolling(config):
         
         print(f"    🔄 Rolling: Train[{train_start.date()} ~ {train_end.date()}] -> Test[{test_start.date()} ~ {test_end.date()}]")
 
-        # 2. 动态切分 Dataset
-        # 利用 DatasetH 的 segments 功能，直接传入 handler 对象，速度很快
         sub_dataset = DatasetH(
             handler=handler,
             segments={
                 'train': (train_start, train_end),
-                'test': (test_start, test_end) # 这里用 valid 还是 test 取决于你想不想验证，通常 rolling 用 test
+                'test': (test_start, test_end)
             }
         )
         
-        # 3. 初始化并训练模型
         model = init_instance_by_config(config['task']['model'])
         model.fit(sub_dataset)
-        last_model = model # 暂存最新模型
+        last_model = model 
         
-        # 4. 预测当前段
         pred = model.predict(sub_dataset, segment='test')
         all_preds.append(pred)
         
-        # 5. 步进
         current_idx += step
 
-    # === 循环结束 ===
-    
-    # 1. 保存拼接后的回测结果
     if all_preds:
         final_pred = pd.concat(all_preds)
         final_pred.to_pickle("predictions/lgbm_rolling_backtest.pkl")
         print(f"✅ 滚动回测完成，累计预测样本数: {len(final_pred)}")
     
-    # 2. 【关键】保存最后一个模型作为 Latest
-    # 这样 predict 模式就会使用这个用“最新数据”训练出来的模型
     if last_model:
         with open("artifacts/lgbm_model_latest.pkl", "wb") as f:
             pickle.dump(last_model, f)
@@ -195,10 +157,12 @@ def _train_rolling(config):
 
 
 # =============================================================================
-# 推理逻辑 (保持不变，或微调)
+# 推理逻辑 (run_predict) - 增加 target_pool 支持 & Redis 推送
 # =============================================================================
-def _predict(config):
-    print(">>> [LGBM] 进入每日推理流程...")
+def run_predict(config, model_name="LGBM", target_pool="csi300"):
+    print(f">>> [{model_name}] 进入每日推理流程...")
+    print(f"    🎯 预测目标池: {target_pool}")
+
     model_path = "artifacts/lgbm_model_latest.pkl"
     
     if not os.path.exists(model_path):
@@ -211,15 +175,22 @@ def _predict(config):
 
     # 2. 准备时间窗口
     today = datetime.now().strftime("%Y-%m-%d")
-    # Alpha158 需要较长的历史数据来计算 Rolling(60) 等特征，建议 100 天缓冲
+    # Alpha158 需要较长的历史数据来计算 Rolling(60) 等特征，建议保留 100 天缓冲
     lookback_start = (datetime.now() - timedelta(days=100)).strftime("%Y-%m-%d")
     print(f"    数据采样: {lookback_start} ~ {today}")
 
-    # 3. 动态配置 Handler (使用 init_instance_by_config)
-    # 【关键修改】复制整个 handler 配置结构 (包含 class, module_path, kwargs)
+    # 3. 动态配置 Handler
+    # 复制整个 handler 配置结构
     handler_config = copy.deepcopy(config['task']['dataset']['kwargs']['handler'])
     
-    # 覆盖起止时间
+    # =========================================================================
+    # 【核心】动态覆盖 instruments (支持 csi300/csi500/all)
+    # 这会显著加快推理速度，因为只加载需要的股票
+    # =========================================================================
+    if target_pool and target_pool != 'all':
+        handler_config['kwargs']['instruments'] = target_pool
+        print(f"    🔄 已将数据加载范围锁定为: {target_pool}")
+    
     handler_config['kwargs']['start_time'] = lookback_start
     handler_config['kwargs']['end_time'] = today
     
@@ -227,49 +198,96 @@ def _predict(config):
     handler_config['kwargs'].pop('fit_start_time', None)
     handler_config['kwargs'].pop('fit_end_time', None)
     
-    # 【核心修复】让 Qlib 自动去实例化 Alpha158，而不是手动调用 DataHandlerLP
-    # 这样 Alpha158 会自动填充 data_loader，解决 AssertionError
     print("    正在初始化 DataHandler (Alpha158)...")
-    dh = init_instance_by_config(handler_config)
+    try:
+        dh = init_instance_by_config(handler_config)
+    except Exception as e:
+        print(f"❌ DataHandler 初始化失败: {e}")
+        print(f"    💡 提示: 请检查本地数据是否包含 {target_pool} 的定义，或者数据是否已更新到今天。")
+        return
 
     # 4. 实例化 Dataset
     ds = DatasetH(handler=dh, segments={"test": [lookback_start, today]})
     
     # 5. 推理
     print("    正在执行预测...")
-    pred = model.predict(ds)
+    try:
+        pred = model.predict(ds)
+    except Exception as e:
+        print(f"❌ 预测失败: {e}")
+        return
     
     if not pred.empty:
         last_date = pred.index.get_level_values("datetime").max()
         print(f"    最新有效信号日期: {last_date}")
         
-        todays_pred = pred.loc[last_date].sort_values(ascending=False)
-        # ==========================================
-        # 【修改点】使用 stock_mapper 和 tabulate 显示
-        # ==========================================
-        print(f"[{last_date}] Top 10 (LGBM):")
+        # 获取当天的预测数据
+        daily_pred = pred.loc[last_date]
         
-        # 1. 转 DataFrame
-        top5_df = todays_pred.head(10).to_frame(name='score')
+        # 兼容 DataFrame/Series 排序 (稳健性处理)
+        if isinstance(daily_pred, pd.DataFrame):
+            col_name = daily_pred.columns[0]
+            todays_pred = daily_pred.sort_values(by=col_name, ascending=False)[col_name]
+        else:
+            todays_pred = daily_pred.sort_values(ascending=False)
         
-        # 2. 映射名称
-        top5_df['name'] = top5_df.index.map(stock_mapper.get_name)
+        print(f"[{last_date}] Top 10 (LGBM) [Pool: {target_pool}]:")
         
-        # 3. 整理列 (名称在前，分数在后)
-        top5_df = top5_df[['name', 'score']]
+        # 结果可视化
+        top_df = todays_pred.head(10).to_frame(name='score')
+        top_df['name'] = top_df.index.map(stock_mapper.get_name)
+        top_df = top_df[['name', 'score']]
         
-        # 4. 打印漂亮表格
-        print(tabulate(top5_df, headers=['代码', '股票名称', '预测得分'], tablefmt='psql', showindex=True))
+        print(tabulate(top_df, headers=['代码', '股票名称', '预测得分'], tablefmt='psql', showindex=True))
         print("-" * 35)
         
-        # _push_to_redis(todays_pred, last_date, "LGBM")
+        # 【新增】推送至 Redis
+        _push_to_redis(todays_pred, last_date, model_name)
+        
     else:
         print("⚠️ 预测结果为空")
 
-def _backtest(config):
-    print(">>> [LGBM] 进入回测分析模式...")
+def _push_to_redis(df, date_obj, model_name):
+    try:
+        r = redis.Redis(host='localhost', port=6379, db=0, socket_timeout=1)
+        target_key = f"TARGET_{model_name.upper()}_{date_obj.strftime('%Y-%m-%d')}"
+        
+        targets = {}
+        
+        # 【核心修复】兼容 Series (预测分) 和 DataFrame (带详情)
+        if isinstance(df, pd.Series):
+            # Series 使用 items() 迭代: (index, value)
+            iterator = df.head(50).items()
+        else:
+            # DataFrame 使用 iterrows() 迭代: (index, Series)
+            iterator = df.head(50).iterrows()
+
+        for instrument, data in iterator:
+            # 如果 data 是 Series (DataFrame的一行)，取 score 列；如果是数值 (Series的值)，直接用
+            # 这里不需要用到分数本身做逻辑，只是为了循环
+            
+            if instrument.startswith('SH'): vt = f"{instrument[2:]}.SSE"
+            elif instrument.startswith('SZ'): vt = f"{instrument[2:]}.SZSE"
+            else: vt = instrument
+            
+            targets[vt] = 1000  # 默认目标持仓数量
+            
+        r.set(target_key, json.dumps(targets))
+        print(f"✅ Redis 推送成功: Key={target_key}")
+    except Exception as e:
+        print(f"⚠️ Redis 推送失败: {e}")
+
+# =============================================================================
+# 回测逻辑 (run_backtest) - 增加 target_pool 过滤
+# =============================================================================
+# =============================================================================
+# 回测逻辑 (run_backtest) - 稳健过滤版
+# =============================================================================
+def run_backtest(config, model_name="LGBM", target_pool="csi300"):
+    print(f">>> [{model_name}] 进入回测分析模式...")
+    print(f"    🎯 回测目标池: {target_pool}")
     
-    # 优先寻找滚动回测的结果，如果没有则找静态的
+    # 路径检查
     rolling_path = "predictions/lgbm_rolling_backtest.pkl"
     static_path = "predictions/lgbm_test_pred.pkl"
     
@@ -283,24 +301,69 @@ def _backtest(config):
         print("❌ 找不到预测文件。请先运行 --mode train")
         return
 
+    print(f"    加载预测数据: {pred_path}")
     pred_df = pd.read_pickle(pred_path)
     
+    # =========================================================================
+    # 【核心修复】稳健的过滤逻辑 (List-based Filter)
+    # =========================================================================
+    if target_pool and target_pool != 'all':
+        print(f"    🔄 正在过滤非 {target_pool} 成分股...")
+        original_count = len(pred_df)
+        
+        try:
+            start_time = pred_df.index.get_level_values("datetime").min()
+            end_time = pred_df.index.get_level_values("datetime").max()
+            
+            # 1. 直接获取这段时间内 CSI300 的“成分股白名单” (List)
+            # as_list=True 会返回所有曾经入选过的股票列表，非常稳健
+            valid_instruments = D.list_instruments(
+                D.instruments(target_pool), 
+                start_time=start_time, 
+                end_time=end_time, 
+                as_list=True
+            )
+            
+            print(f"    📊 {target_pool} 有效成分股数量: {len(valid_instruments)}")
+            
+            if len(valid_instruments) == 0:
+                print("    ⚠️ 警告: 成分股列表为空！请检查 instruments 文件。")
+            else:
+                # 2. 仅根据“股票代码”进行过滤 (忽略日期的严格对齐)
+                # 这种方式极快，且不会因为某天行情缺失而丢数据
+                pred_df = pred_df[pred_df.index.get_level_values("instrument").isin(valid_instruments)]
+                
+                print(f"    ✅ 过滤完成: {original_count} -> {len(pred_df)} 条记录")
+                
+        except Exception as e:
+            print(f"    ⚠️ 过滤失败: {e}")
+            print("    将继续使用原始数据回测...")
+            
+    else:
+        print("    🚀 全市场回测 (target_pool=all)")
+
+    # 再次检查
+    if pred_df.empty:
+        print("❌ 错误: 过滤后数据为空！请检查 target_pool 是否正确。")
+        return
+
+    # 执行回测
     run_backtest_analysis(
         pred_df,
-        output_prefix="predictions/lgbm",
+        output_prefix=f"predictions/lgbm_{target_pool}",
         topk=50,
-        benchmark=config.get('benchmark', 'sh000300')
+        benchmark=config.get('benchmark', 'SH000300')
     )
 
 # =============================================================================
-# 统一接口
+# 统一接口 (兼容 Main.py)
 # =============================================================================
-def execute(config, mode):
+def execute(config, mode, target_pool="csi300"):
     if mode == 'train':
-        _train(config)
+        run_train(config)
     elif mode == 'predict':
-        _predict(config)
+        run_predict(config, target_pool=target_pool)
     elif mode == 'backtest':
-        _backtest(config)
+        run_backtest(config, target_pool=target_pool)
     else:
         print(f"❌ 不支持的模式: {mode}")

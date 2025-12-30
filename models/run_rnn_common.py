@@ -12,6 +12,7 @@ from models.backtest_utils import run_backtest_analysis
 import copy
 from models.stock_utils import stock_mapper
 from tabulate import tabulate
+from qlib.data import D
 
 # =============================================================================
 # 辅助函数：动态加载类
@@ -75,10 +76,11 @@ def run_train(config, model_name):
             print(f"⚠️ 验证集预测失败 (可能是内存不足或数据切片问题): {e}")
 
 # =============================================================================
-# 推理逻辑 (run_predict) 
+# 推理逻辑 (run_predict) - 动态筛选版 & Redis 集成
 # =============================================================================
-def run_predict(config, model_name):
+def run_predict(config, model_name, target_pool="csi300"):
     print(f">>> [{model_name}] 进入每日推理流程...")
+    print(f"    🎯 预测目标池: {target_pool}")
     
     model_path = f"artifacts/{model_name.lower()}_model_latest.pkl"
     if not os.path.exists(model_path):
@@ -90,46 +92,48 @@ def run_predict(config, model_name):
         model = pickle.load(f)
 
     # -------------------------------------------------------------------------
-    # 【核心修复】给模型打补丁，注入假的 writer
+    # 给模型打补丁 (DummyWriter)
     # -------------------------------------------------------------------------
     if not hasattr(model, '_writer') or model._writer is None:
-        # print("    🔧 检测到模型缺少 _writer，正在注入 DummyWriter...")
         model._writer = DummyWriter()
     
-    # 有些旧版 TRA 可能还需要 global_step
     if not hasattr(model, 'global_step'):
         model.global_step = 0
     # -------------------------------------------------------------------------
 
-    # 2. 准备时间窗口 (Rolling Fit)
+    # 2. 准备时间窗口
     dataset_conf_origin = config['task']['dataset']
-    # TRA 也是 step_len
-    seq_len = dataset_conf_origin['kwargs'].get('step_len', 40)
-    
     today = datetime.now().strftime("%Y-%m-%d")
     lookback_start = (datetime.now() - timedelta(days=200)).strftime("%Y-%m-%d")
     print(f"    数据采样: {lookback_start} ~ {today} (Rolling Fit)")
 
     # 3. 动态配置 Handler
-    # ... (以下代码保持之前的逻辑不变) ...
+    # 这里我们深拷贝一份配置，以免修改了全局 Config
     handler_config = copy.deepcopy(dataset_conf_origin['kwargs']['handler'])
+    
+    # =========================================================================
+    # 动态覆盖 instruments
+    # =========================================================================
+    if target_pool and target_pool != 'all':
+        handler_config['kwargs']['instruments'] = target_pool
+        print(f"    🔄 已将数据加载范围锁定为: {target_pool}")
+    # =========================================================================
+
     handler_config['kwargs']['start_time'] = lookback_start
     handler_config['kwargs']['end_time'] = today
     handler_config['kwargs']['fit_start_time'] = lookback_start
     handler_config['kwargs']['fit_end_time'] = today
     
-    print(f"    正在初始化 DataHandler (Alpha158)...")
+    print(f"    正在初始化 DataHandler...")
     try:
         dh = init_instance_by_config(handler_config)
     except Exception as e:
         print(f"❌ DataHandler 初始化失败: {e}")
         return
 
-    # 4. 实例化 Dataset (动态加载)
+    # 4. 实例化 Dataset
     ds_class_name = dataset_conf_origin['class']
     ds_module_path = dataset_conf_origin['module_path']
-    
-    print(f"    正在初始化数据集: {ds_class_name}...")
     DatasetClass = get_dataset_class(ds_class_name, ds_module_path)
     
     ds_kwargs = copy.deepcopy(dataset_conf_origin['kwargs'])
@@ -144,10 +148,6 @@ def run_predict(config, model_name):
         pred_score = model.predict(dataset)
     except Exception as e:
         print(f"❌ 预测失败: {e}")
-        print(f"    Dataset Type: {type(dataset)}")
-        # 打印详细错误堆栈，方便排查其他问题
-        import traceback
-        traceback.print_exc()
         return
     
     if pred_score.empty:
@@ -157,35 +157,32 @@ def run_predict(config, model_name):
     last_date = pred_score.index.get_level_values("datetime").max()
     print(f"    最新有效信号日期: {last_date}")
     
-    # todays_pred = pred_score.loc[last_date].sort_values(ascending=False)
-    
-    # print(f"[{last_date}] Top 10 ({model_name}):")
-    # 获取当天的预测数据
+    # 获取并排序当天的预测数据
     daily_pred = pred_score.loc[last_date]
     
-    # =========================================================================
-    # 【核心修复】兼容 DataFrame (TRA) 和 Series (LSTM)
-    # =========================================================================
+    # 兼容 DataFrame/Series 排序
     if isinstance(daily_pred, pd.DataFrame):
-        # 如果是 DataFrame，取第一列作为排序依据（通常是 'score'）
         col_name = daily_pred.columns[0]
-        # 排序，并提取为 Series，以保证后续逻辑统一
         todays_pred = daily_pred.sort_values(by=col_name, ascending=False)[col_name]
     else:
-        # 如果是 Series，直接排序
         todays_pred = daily_pred.sort_values(ascending=False)
-    # =========================================================================
     
+    # 打印 Top 10
     top_df = todays_pred.head(10).to_frame(name='score')
     top_df['name'] = top_df.index.map(stock_mapper.get_name)
     top_df = top_df[['name', 'score']]
     
+    print(f"[{last_date}] Top 10 ({model_name}) [Pool: {target_pool}]:")
     print(tabulate(top_df, headers=['代码', '股票名称', '预测得分'], tablefmt='psql', showindex=True))
     print("-" * 35)
 
+    # 推送 Redis
     _push_to_redis(todays_pred, last_date, model_name)
 
 def _push_to_redis(df, date_obj, model_name):
+    """
+    Redis 推送辅助函数
+    """
     try:
         r = redis.Redis(host='localhost', port=6379, db=0, socket_timeout=1)
         target_key = f"TARGET_{model_name.upper()}_{date_obj.strftime('%Y-%m-%d')}"
@@ -201,9 +198,7 @@ def _push_to_redis(df, date_obj, model_name):
             iterator = df.head(50).iterrows()
 
         for instrument, data in iterator:
-            # 如果 data 是 Series (DataFrame的一行)，取 score 列；如果是数值 (Series的值)，直接用
-            # 这里不需要用到分数本身做逻辑，只是为了循环
-            
+            # 格式化代码
             if instrument.startswith('SH'): vt = f"{instrument[2:]}.SSE"
             elif instrument.startswith('SZ'): vt = f"{instrument[2:]}.SZSE"
             else: vt = instrument
@@ -215,27 +210,71 @@ def _push_to_redis(df, date_obj, model_name):
     except Exception as e:
         print(f"⚠️ Redis 推送失败: {e}")
 
-def run_backtest(config, model_name):
+
+# =============================================================================
+# 回测逻辑 (run_backtest) - 稳健过滤版 (Robust Filter)
+# =============================================================================
+def run_backtest(config, model_name, target_pool="csi300"):
     print(f">>> [{model_name}] 进入回测分析模式...")
+    print(f"    🎯 回测目标池: {target_pool}")
     
     # 1. 确定预测文件路径
-    # 我们回测的是之前训练时生成的“测试集预测结果”
     pred_path = f"predictions/{model_name.lower()}_test_pred.pkl"
     
     if not os.path.exists(pred_path):
         print(f"❌ 找不到预测文件: {pred_path}")
-        print("   请先运行 --mode train 生成测试集预测结果。")
+        print("    请先运行 --mode train 生成测试集预测结果。")
         return
 
     # 2. 加载预测数据
     print(f"    加载预测数据: {pred_path}")
     pred_df = pd.read_pickle(pred_path)
     
-    # 3. 执行回测
-    # 输出文件前缀: predictions/lstm
+    # =========================================================================
+    # 【核心新增】稳健过滤逻辑 (List-based Filter)
+    # =========================================================================
+    if target_pool and target_pool != 'all':
+        print(f"    🔄 正在过滤非 {target_pool} 成分股...")
+        original_count = len(pred_df)
+        
+        try:
+            start_time = pred_df.index.get_level_values("datetime").min()
+            end_time = pred_df.index.get_level_values("datetime").max()
+            
+            # 1. 获取白名单 (as_list=True 忽略时间对齐，只看代码)
+            valid_instruments = D.list_instruments(
+                D.instruments(target_pool), 
+                start_time=start_time, 
+                end_time=end_time, 
+                as_list=True
+            )
+            
+            print(f"    📊 {target_pool} 有效成分股数量: {len(valid_instruments)}")
+            
+            if len(valid_instruments) == 0:
+                print("    ⚠️ 警告: 成分股列表为空！请检查 instruments 文件。")
+            else:
+                # 2. 仅根据“股票代码”进行过滤
+                # 这种方式极快，且不会因为某天行情缺失而丢数据
+                pred_df = pred_df[pred_df.index.get_level_values("instrument").isin(valid_instruments)]
+                
+                print(f"    ✅ 过滤完成: {original_count} -> {len(pred_df)} 条记录")
+                
+        except Exception as e:
+            print(f"⚠️ 过滤失败: {e}")
+            print("    将继续使用原始数据回测...")
+    else:
+        print("    🚀 全市场回测 (target_pool=all)")
+
+    # 3. 再次检查数据是否为空
+    if pred_df.empty:
+        print(f"❌ 错误: 过滤后数据为空！请检查 target_pool={target_pool} 是否正确，或时间范围是否匹配。")
+        return
+
+    # 4. 执行回测
     run_backtest_analysis(
         pred_df, 
-        output_prefix=f"predictions/{model_name.lower()}",
+        output_prefix=f"predictions/{model_name.lower()}_{target_pool}",
         topk=50, 
-        benchmark=config.get('benchmark', 'sh000300')
+        benchmark=config.get('benchmark', 'SH000300')
     )

@@ -32,7 +32,7 @@ data_handler_config: &data_handler_config
 
   learn_processors:
     - class: DropnaLabel
-    - class: CSZScoreNorm
+    - class: CSRankNorm
       kwargs:
         fields_group: label
   
@@ -74,7 +74,7 @@ task:
       n_epochs: 200
       lr: 0.001
       early_stop: 10
-      batch_size: 1024     # 显存允许的情况下，256 或 512 都不错
+      batch_size: 8192     # 显存允许的情况下，256 或 512 都不错
       metric: loss
       loss: mse
       

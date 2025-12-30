@@ -115,7 +115,7 @@ task:
       step_len: 40
       input_size: 158
       num_states: *num_states
-      batch_size: 1024
+      batch_size: 8192
       n_samples:
       memory_mode: *memory_mode
       drop_last: True
