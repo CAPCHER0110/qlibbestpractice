@@ -97,11 +97,11 @@ python main.py --model tra --mode predict
 
 | 模型名称 | 命令行参数 `--model` | 配置文件 | 说明 |
 | --- | --- | --- | --- |
-| **TRA** | `tra` | `tra_config.yaml` | Temporal Routing Adaptor，擅长捕捉长期依赖。 |
 | **LightGBM** | `lgbm` | `lgbm_config.yaml` | GBDT 树模型。**支持 Rolling Retraining (滚动重训)**，抗噪性强。 |
 | **LSTM** | `lstm` | `lstm_config.yaml` | 经典 RNN 模型，深度学习基准。 |
 | **ALSTM** | `alstm` | `alstm_config.yaml` | 引入 Attention 机制的 LSTM。 |
 | **Transformer** | `transformer` | `transformer_config.yaml` | 基于 Self-Attention 的时序模型。 |
+| **TRA** | `tra` | `tra_config.yaml` | Temporal Routing Adaptor，擅长捕捉长期依赖。 |
 
 ### 关于 LightGBM 的滚动训练
 
