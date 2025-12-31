@@ -110,7 +110,7 @@ def format_float(val, digits=4):
     return f"{val:.{digits}f}" if isinstance(val, (float, int)) else val
 
 def main():
-    parser = argparse.ArgumentParser(description="Qlib 自动化 Benchmark (完整版)")
+    parser = argparse.ArgumentParser(description="Qlib 自动化 Benchmark (Markdown修复版)")
     parser.add_argument('--models', type=str, default="all", help='模型列表')
     parser.add_argument('--train', action='store_true', help='是否重新训练')
     parser.add_argument('--output', type=str, default="benchmark_report.md", help='报告保存文件名')
@@ -212,8 +212,9 @@ def main():
                 "信息系数 (Mean IC)": format_float(r.get('Mean IC', 0)),
                 "秩信息系数 (Rank IC)": format_float(r.get('Mean Rank IC', 0))
             })
-            
-        log(tabulate(table_list, headers="keys", tablefmt="github"))
+        
+        # 【修复点 1】强制使用 pipe 格式，这是最标准的 Markdown 表格格式
+        log(tabulate(table_list, headers="keys", tablefmt="pipe"))
 
     # --- Part 2: 预测信号 ---
     log("\n\n### 2. Top 5 预测信号 (Prediction Signals)")
@@ -226,17 +227,14 @@ def main():
             log("暂无数据 (No data)")
             continue
 
-        # 1. 统计共识 (找最强推荐)
         all_stocks_names = []
         for p in pool_preds:
-            # 提取所有出现的股票名称用于统计
             for item in p['TopList']:
-                all_stocks_names.append(item['name']) # 只统计名称
+                all_stocks_names.append(item['name'])
         
         counts = Counter(all_stocks_names)
         consensus_stock_name = counts.most_common(1)[0][0] if counts else None
         
-        # 2. 构建表格
         table_data = []
         for p in pool_preds:
             row = { "模型名称 (Model)": p['Model'] }
@@ -246,18 +244,18 @@ def main():
                     # 格式: 代码 名称 (得分)
                     display = f"{item['code']} {item['name']} ({float(item['score']):.3f})"
                     
-                    # 如果这只股票就是共识冠军，加火
                     if item['name'] == consensus_stock_name:
                         display += " 🔥"
                 else:
                     display = "-"
                 
-                row[f"第{i+1}名 (代码|名称|得分)"] = display
+                # 【修复点 2】将表头中的 `|` 替换为 `/`，防止 Markdown 表格破损
+                row[f"第{i+1}名 (代码/名称/得分)"] = display
             table_data.append(row)
             
-        log(tabulate(table_data, headers="keys", tablefmt="github"))
+        # 【修复点 1】强制使用 pipe 格式
+        log(tabulate(table_data, headers="keys", tablefmt="pipe"))
         
-        # 3. 【修复点】找回丢失的共识输出逻辑
         if consensus_stock_name:
             count = counts[consensus_stock_name]
             log(f"\n> 🏆 **最强推荐 (Consensus):** **{consensus_stock_name}** (获得 {count} 个模型同时推荐)")
