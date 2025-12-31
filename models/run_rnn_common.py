@@ -101,6 +101,11 @@ def run_predict(config, model_name, target_pool="csi300"):
         model.global_step = 0
     # -------------------------------------------------------------------------
 
+    # =============== 必须加上这一行 ===============
+    print(f"    🔧 [Local Fix] 强制重置 n_jobs=0 (原配置: {getattr(model, 'n_jobs', 'Unknown')})")
+    model.n_jobs = 0  # <--- 强制让模型忘记服务器的高配，适应本地环境
+    # ============================================
+
     # 2. 准备时间窗口
     dataset_conf_origin = config['task']['dataset']
     today = datetime.now().strftime("%Y-%m-%d")
@@ -114,7 +119,7 @@ def run_predict(config, model_name, target_pool="csi300"):
     # =========================================================================
     # 动态覆盖 instruments
     # =========================================================================
-    if target_pool and target_pool != 'all':
+    if target_pool:
         handler_config['kwargs']['instruments'] = target_pool
         print(f"    🔄 已将数据加载范围锁定为: {target_pool}")
     # =========================================================================

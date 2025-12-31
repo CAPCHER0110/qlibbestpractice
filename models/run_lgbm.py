@@ -187,7 +187,7 @@ def run_predict(config, model_name="LGBM", target_pool="csi300"):
     # 【核心】动态覆盖 instruments (支持 csi300/csi500/all)
     # 这会显著加快推理速度，因为只加载需要的股票
     # =========================================================================
-    if target_pool and target_pool != 'all':
+    if target_pool:
         handler_config['kwargs']['instruments'] = target_pool
         print(f"    🔄 已将数据加载范围锁定为: {target_pool}")
     

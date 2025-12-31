@@ -1,7 +1,7 @@
 from models.run_rnn_common import run_train, run_predict, run_backtest
 
 def execute(config, mode, target_pool):
-    model_name = "LSTM"
+    model_name = "ALSTM"
     if mode == 'train':
         run_train(config, model_name=model_name)
     elif mode == 'predict':
